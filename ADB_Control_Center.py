@@ -21,7 +21,7 @@ from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
 APP_TITLE = "ADB Control Center"
-APP_VERSION = "0.6.3"
+APP_VERSION = "0.6.5"
 APP_RELEASE_DATE = "2026-05-18"
 __version__ = APP_VERSION
 AUTHOR_NAME = "Flavio Lira"
@@ -759,8 +759,19 @@ class ADBGui(tk.Tk):
 
         lower = ttk.LabelFrame(self.tab_dashboard, text="Command Output", padding=10)
         lower.pack(fill="both", expand=True, pady=(10, 0))
+
+        output_controls = ttk.Frame(lower)
+        output_controls.pack(fill="x", pady=(0, 6))
+        ttk.Button(output_controls, text="Check ADB", command=self.check_adb).pack(side="left")
+        ttk.Button(output_controls, text="Refresh Devices", command=self.refresh_devices).pack(side="left", padx=(6, 0))
+        ttk.Button(output_controls, text="Load Device Info", command=self.load_device_info).pack(side="left", padx=(6, 0))
+        ttk.Button(output_controls, text="Start Server", command=lambda: self.run_background_action("adb start-server", self._start_server)).pack(side="left", padx=(6, 0))
+        ttk.Button(output_controls, text="Kill Server", command=lambda: self.run_background_action("adb kill-server", self._kill_server)).pack(side="left", padx=(6, 0))
+        ttk.Button(output_controls, text="Clear Output", command=lambda: self.clear_text(self.dashboard_output)).pack(side="right")
+
         self.dashboard_output = ScrolledText(lower, wrap="word")
         self.dashboard_output.pack(fill="both", expand=True)
+        self.append_dashboard_output("Dashboard ready", "Use the buttons above or the top toolbar to run ADB status/device actions.")
 
     def _build_shell_tab(self):
         controls = ttk.Frame(self.tab_shell)
@@ -1289,10 +1300,23 @@ class ADBGui(tk.Tk):
         if self._closing:
             return
         try:
+            text = "" if text is None else str(text)
             widget.insert(tk.END, text + ("\n" if not text.endswith("\n") else ""))
             widget.see(tk.END)
         except tk.TclError:
             pass
+
+    def append_dashboard_output(self, label, text="", command=None):
+        if self._closing or not hasattr(self, "dashboard_output"):
+            return
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        parts = [f"[{timestamp}] {label}"]
+        if command:
+            parts.append(f"$ {command}")
+        if text:
+            parts.append(str(text).rstrip())
+        parts.append("-" * 72)
+        self.append_text(self.dashboard_output, "\n".join(parts))
 
     def _note_dropped_logcat_ui_line(self, count=1):
         with self.logcat_queue_lock:
@@ -1361,16 +1385,26 @@ class ADBGui(tk.Tk):
         return values
 
     def run_background_action(self, label, func, *args, widget=None):
+        target_widget = widget if widget is not None else self.dashboard_output
+
         def worker():
             try:
-                self.ui_call(lambda: self.set_status(f"Running: {label}"))
+                self.ui_call(lambda l=label: self.set_status(f"Running: {l}"))
+                self.ui_call(lambda l=label: self.append_text(target_widget, f"\n>>> Running: {l}"))
                 result = func(*args)
-                if result:
-                    self.ui_call(lambda: self.append_text(widget or self.dashboard_output, result))
+                output = str(result).rstrip() if result is not None else ""
+                if output:
+                    self.ui_call(lambda o=output: self.append_text(target_widget, o))
+                else:
+                    self.ui_call(lambda: self.append_text(target_widget, "Command completed with no output."))
+                if target_widget is not self.dashboard_output:
+                    self.ui_call(lambda l=label, o=output: self.append_dashboard_output(l, o or "Command completed with no output."))
                 self.ui_call(lambda: self.set_status("Ready"))
             except Exception as exc:
                 self.ui_call(lambda: self.set_status("Error"))
-                self.ui_call(lambda e=exc: self.append_text(widget or self.dashboard_output, f"ERROR: {e}"))
+                self.ui_call(lambda e=exc: self.append_text(target_widget, f"ERROR: {e}"))
+                if target_widget is not self.dashboard_output:
+                    self.ui_call(lambda l=label, e=exc: self.append_dashboard_output(l, f"ERROR: {e}"))
                 self.ui_call(lambda e=exc: messagebox.showerror(APP_TITLE, str(e)))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1612,10 +1646,12 @@ class ADBGui(tk.Tk):
                 version = worker()
                 self.ui_call(lambda: self.clear_text(self.adb_status_text))
                 self.ui_call(lambda v=version: self.append_text(self.adb_status_text, v))
+                self.ui_call(lambda v=version: self.append_dashboard_output("Check ADB", v, command="adb version"))
                 self.ui_call(lambda: self.set_status("ADB is available"))
             except Exception as exc:
                 self.ui_call(lambda: self.clear_text(self.adb_status_text))
                 self.ui_call(lambda e=exc: self.append_text(self.adb_status_text, f"ADB not available: {e}"))
+                self.ui_call(lambda e=exc: self.append_dashboard_output("Check ADB", f"ADB not available: {e}", command="adb version"))
                 self.ui_call(lambda: self.set_status("ADB not available"))
 
         threading.Thread(target=bg, daemon=True).start()
@@ -1704,15 +1740,25 @@ class ADBGui(tk.Tk):
             elif version_error:
                 self.append_text(self.adb_status_text, f"ADB issue: {version_error}")
             self.append_text(self.adb_status_text, "")
+            dashboard_lines = []
+            if version_text:
+                dashboard_lines.append(version_text)
+            elif version_error:
+                dashboard_lines.append(f"ADB issue: {version_error}")
+            dashboard_lines.append("")
             if devices:
                 for d in devices:
-                    self.append_text(self.adb_status_text, f"{d['serial']} | {d['state']} | {d['model']} {d['meta']}")
+                    line = f"{d['serial']} | {d['state']} | {d['model']} {d['meta']}"
+                    self.append_text(self.adb_status_text, line)
+                    dashboard_lines.append(line)
                 if not self.remote_tree.get_children():
                     self.after(100, self.refresh_remote_files)
             else:
                 self.append_text(self.adb_status_text, "No devices detected.")
+                dashboard_lines.append("No devices detected.")
                 self.remote_tree.delete(*self.remote_tree.get_children())
                 self.remote_entries = []
+            self.append_dashboard_output("Refresh Devices", "\n".join(dashboard_lines), command="adb devices -l")
 
         def bg():
             try:
@@ -1723,6 +1769,7 @@ class ADBGui(tk.Tk):
                 self.ui_call(lambda: self.set_status("ADB not ready"))
                 self.ui_call(lambda: self.clear_text(self.adb_status_text))
                 self.ui_call(lambda e=exc: self.append_text(self.adb_status_text, f"ADB not available: {e}"))
+                self.ui_call(lambda e=exc: self.append_dashboard_output("Refresh Devices", f"ADB not available: {e}", command="adb devices -l"))
                 self.devices = []
                 self.ui_call(lambda: self.device_combo.configure(values=[]))
                 self.ui_call(lambda: self.selected_serial.set(""))
@@ -1759,6 +1806,7 @@ class ADBGui(tk.Tk):
         def done(text):
             self.clear_text(self.device_info_text)
             self.append_text(self.device_info_text, text)
+            self.append_dashboard_output(f"Device Info: {serial}", text, command="adb shell getprop / dumpsys battery")
 
         def bg():
             try:
@@ -2045,9 +2093,17 @@ class ADBGui(tk.Tk):
             except tk.TclError:
                 visible_seed = ""
         flt = self.logcat_filter_var.get().strip()
-        cmd = self.manager.adb_cmd("logcat", serial=serial)
-        if flt:
-            cmd.extend(split_user_args(flt))
+        try:
+            cmd = self.manager.adb_cmd("logcat", serial=serial)
+            if flt:
+                cmd.extend(split_user_args(flt))
+        except Exception as exc:
+            if reconnecting:
+                self.enqueue_logcat_event({"event": "logcat_status", "message": f"[auto reconnect failed to build logcat command] {exc}"})
+            else:
+                messagebox.showerror(APP_TITLE, str(exc))
+                self.set_status("Error")
+            return
 
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if is_windows() else 0
         try:
@@ -2329,7 +2385,12 @@ class ADBGui(tk.Tk):
         if not serial:
             return
         remote = f"/sdcard/screenrecord_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
-        cmd = self.manager.adb_cmd("shell", "screenrecord", remote, serial=serial)
+        try:
+            cmd = self.manager.adb_cmd("shell", "screenrecord", remote, serial=serial)
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, str(exc))
+            self.set_status("Error")
+            return
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if is_windows() else 0
         try:
             self.screenrecord_process = subprocess.Popen(

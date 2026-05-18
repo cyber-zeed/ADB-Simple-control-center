@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Version: 0.6.3
+Version: 0.6.5
 
 ## `adb` was not found
 
@@ -53,7 +53,7 @@ Use the Files tab path field and try one of these:
 /
 ```
 
-v0.6.3 handles blank paths and safe fallbacks more defensively, but Android permission restrictions can still prevent browsing some folders.
+v0.6.5 handles blank paths and safe fallbacks more defensively, but Android permission restrictions can still prevent browsing some folders.
 
 ## USB auto-reconnect did not resume
 
@@ -66,3 +66,9 @@ Install Python 3 from the **Installers** tab or from Python.org. Make sure it is
 ## The GUI opens but some installer buttons do nothing
 
 Installer/status actions run in background workers. Watch the installer output panel for progress and error messages. Network access may be required for downloading current installers.
+
+## Dashboard output looks empty
+
+Use version 0.6.5 or newer. Earlier builds only wrote some actions to the Dashboard command output box. In 0.6.5, Dashboard quick buttons and background actions write timestamped command history entries.
+
+If output is still empty, click **Check ADB** or **Refresh Devices** in the Dashboard tab. If ADB is missing or not working, the error should appear in both ADB Status and Command Output.

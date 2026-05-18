@@ -1,6 +1,6 @@
 # ADB Control Center
 
-**Version:** 0.6.3  
+**Version:** 0.6.5  
 **Release date:** 2026-05-18  
 **Author/Credits:** Flavio Lira (CyberZeed)  
 **E-mail:** fr.lira@gmail.com  
@@ -18,6 +18,9 @@ USER_MANUAL.md
 TROUBLESHOOTING.md
 CHANGELOG.md
 RELEASE_NOTES.md
+VERSION
+VERSIONING.md
+VALIDATION_v0.6.5.md
 requirements.txt
 .gitignore
 ```
@@ -88,7 +91,7 @@ python .\ADB_Control_Center.py
 - Push local files/folders to the selected Android folder.
 - Pull selected remote files/folders.
 - Remote listing uses a NUL-delimited shell protocol instead of parsing plain `ls` output, improving support for filenames with spaces, quotes, brackets, Unicode, and embedded newlines.
-- v0.6.3 fixes the raw `__ADBGUI_ERROR__...` popup and adds safe remote path fallbacks.
+- v0.6.5 fixes the raw `__ADBGUI_ERROR__...` popup and adds safe remote path fallbacks.
 
 ### Other tools
 
@@ -123,9 +126,13 @@ MAJOR.MINOR.PATCH
 - Minor: new features or UI improvements.
 - Major: breaking changes or stable release milestone.
 
-v0.6.3 is a patch release over v0.6.1.
+v0.6.5 is a patch release over v0.6.1.
 
 
-## v0.6.3 note
+## v0.6.5 note
 
 This patch corrects the GitHub link in Help → About and project documentation to `https://github.com/Cyber-Zeed`.
+
+### Dashboard command output improvements
+
+Version 0.6.5 improves the Dashboard tab so command output is visible and easier to follow. The Dashboard now includes quick action buttons for Check ADB, Refresh Devices, Load Device Info, Start Server, Kill Server, and Clear Output. A timestamped command history is also written to the Dashboard command output area for ADB status checks, device refreshes, device info, and background actions.

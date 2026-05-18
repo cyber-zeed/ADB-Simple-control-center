@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.6.5 - 2026-05-18
+
+### Fixed
+
+- Hardened Logcat startup command construction against missing ADB/path failures.
+- Hardened Screenrecord startup command construction against missing ADB/path failures.
+
+### Validation
+
+- Full static validation pass over the package.
+- Syntax, AST, import smoke, helper, parser, package-integrity, and metadata checks passed.
+
+## v0.6.4 - 2026-05-18
+
+### Fixed
+- Fixed Dashboard Command Output appearing unused or blank for common Dashboard actions.
+- Added timestamped Dashboard command-history entries for ADB checks, device refreshes, device info, and background actions.
+
+### Added
+- Added Dashboard quick action buttons: Check ADB, Refresh Devices, Load Device Info, Start Server, Kill Server, and Clear Output.
+
 ## v0.6.3 - 2026-05-18
 
 ### Fixed

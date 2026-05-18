@@ -1,6 +1,6 @@
 # ADB Control Center User Manual
 
-Version: 0.6.3  
+Version: 0.6.5  
 Release date: 2026-05-18
 
 ## 1. Starting the application
@@ -115,7 +115,7 @@ The Files tab supports both direct push/pull paths and the remote Android browse
 - Select an item and use **Pull Selected** to copy it to the PC.
 - Use **Push Local to Current Folder** to push a PC file/folder into the currently displayed Android folder.
 
-v0.6.3 includes safer handling for blank/inaccessible remote paths and no longer shows raw internal error markers.
+v0.6.5 includes safer handling for blank/inaccessible remote paths and no longer shows raw internal error markers.
 
 ## 7. Shell and Raw ADB tabs
 
@@ -160,3 +160,16 @@ Use **Help → About** to view app version, credits, contact e-mail, and GitHub 
 Credits: Flavio Lira (CyberZeed)
 E-mail: fr.lira@gmail.com
 GitHub: https://github.com/Cyber-Zeed
+
+## Dashboard command output
+
+The Dashboard tab contains three areas: ADB Status, Device Info, and Command Output. In version 0.6.5, the Command Output area has quick action buttons:
+
+- Check ADB
+- Refresh Devices
+- Load Device Info
+- Start Server
+- Kill Server
+- Clear Output
+
+Dashboard actions write timestamped entries to Command Output. This makes it easier to confirm whether a button actually ran, what command was used, and what ADB returned.
