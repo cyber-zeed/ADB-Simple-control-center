@@ -18,9 +18,6 @@ USER_MANUAL.md
 TROUBLESHOOTING.md
 CHANGELOG.md
 RELEASE_NOTES.md
-VERSION
-VERSIONING.md
-VALIDATION_v0.6.3.md
 requirements.txt
 .gitignore
 ```
