@@ -21,7 +21,7 @@ from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
 APP_TITLE = "ADB Control Center"
-APP_VERSION = "0.6.5"
+APP_VERSION = "0.7.0"
 APP_RELEASE_DATE = "2026-05-18"
 __version__ = APP_VERSION
 AUTHOR_NAME = "Flavio Lira"
@@ -32,6 +32,9 @@ PLATFORM_TOOLS_URL = "https://dl.google.com/android/repository/platform-tools-la
 PYTHON_WINDOWS_RELEASES_URL = "https://www.python.org/downloads/windows/"
 PYTHON_DOWNLOADS_URL = "https://www.python.org/downloads/"
 SEVENZIP_DOWNLOADS_URL = "https://www.7-zip.org/download.html"
+SETTINGS_SCHEMA_VERSION = 1
+SETTINGS_APP_DIR_NAME = "ADB Control Center"
+
 SEVENZIP_BASE_URL = "https://www.7-zip.org/"
 DEFAULT_INSTALL_DIR = r"C:\adb"
 LEGACY_INSTALL_DIRS = [r"C:\platform-tools"]
@@ -45,6 +48,10 @@ LOGCAT_UI_QUEUE_MAX_ITEMS = 20000
 LOGCAT_POLL_TIME_BUDGET_SEC = 0.030
 LOGCAT_UI_MAX_LINES = 8000
 LOGCAT_UI_TRIM_TO_LINES = 6000
+# Flush each accepted raw logcat line to the temporary session file. This is
+# intentionally conservative: the UI may drop lines under heavy load, but the
+# spool file should keep the complete stream that adb emitted.
+LOGCAT_SPOOL_FLUSH_EVERY_LINES = 1
 
 
 def is_windows() -> bool:
@@ -84,7 +91,19 @@ def run_quick(command, timeout=30, creationflags=0, cwd=None):
 def split_user_args(text: str):
     text = text or ""
     try:
-        return shlex.split(text, posix=True)
+        # posix=False preserves unquoted Windows paths such as C:\Users\Me\app.apk.
+        # After parsing, strip only matching outer quotes so quoted paths with spaces
+        # still work correctly.
+        lexer = shlex.shlex(text, posix=False)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+        cleaned = []
+        for token in tokens:
+            if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}:
+                token = token[1:-1]
+            cleaned.append(token)
+        return cleaned
     except ValueError:
         # Fall back to a simple split for malformed quoting so the GUI stays usable.
         return text.split()
@@ -287,6 +306,12 @@ class ADBManager:
         # Some devices resolve /sdcard differently, and a few builds may expose
         # only /storage/emulated/0. Try safe fallbacks before surfacing an error.
         candidates = [remote_path]
+        if remote_path == "/sdcard" or remote_path.startswith("/sdcard/"):
+            mapped = "/storage/emulated/0" + remote_path[len("/sdcard"):]
+            candidates.append(mapped)
+        if remote_path == "/storage/emulated/0" or remote_path.startswith("/storage/emulated/0/"):
+            mapped = "/sdcard" + remote_path[len("/storage/emulated/0"):]
+            candidates.append(mapped)
         if remote_path in {"/sdcard", "/storage/emulated/0"}:
             candidates.extend(["/storage/emulated/0", "/sdcard", "/"])
 
@@ -622,8 +647,9 @@ class ADBManager:
 class ADBGui(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(APP_TITLE)
-        self.geometry("1280x840")
+        self.title(f"{APP_TITLE} v{APP_VERSION}")
+        self.settings = self.load_settings()
+        self.geometry(self.settings.get("window_geometry") or "1280x840")
         self.minsize(1100, 760)
 
         self.manager = ADBManager()
@@ -647,18 +673,30 @@ class ADBGui(tk.Tk):
         self.logcat_ui_line_count = 0
         self.logcat_save_lock = threading.Lock()
         self.logcat_session_file = None
+        self.logcat_filtered_session_file = None
+        self.logcat_filter_description = None
+        self.logcat_filter_text = ""
         self.logcat_session_timestamp_enabled = False
+        self.logcat_expected_reboot_serial = None
+        self.logcat_expected_reboot_mode = None
         self.logcat_next_start_clear_visible = False
         self.logcat_next_start_seed_visible = False
         self.screenrecord_process = None
         self.screenrecord_remote = None
         self.screenrecord_serial = None
         self._closing = False
+        self._settings_save_after_id = None
+        self._settings_ready = False
+        self._active_operation_proc = None
+        self._active_operation_dialog = None
+        self._active_operation_cancel_requested = False
 
         self._build_style()
         self._build_menu()
         self._build_top_bar()
         self._build_tabs()
+        self._bind_settings_autosave()
+        self._settings_ready = True
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self._poll_queues()
         self.after(250, self.refresh_devices)
@@ -697,12 +735,14 @@ class ADBGui(tk.Tk):
         ttk.Label(top, text="Device:").pack(side="left")
         self.device_combo = ttk.Combobox(top, textvariable=self.selected_serial, width=50, state="readonly")
         self.device_combo.pack(side="left", padx=(6, 8))
+        self.device_combo.bind("<<ComboboxSelected>>", self._on_device_combo_selected)
 
         ttk.Button(top, text="Refresh", command=self.refresh_devices).pack(side="left")
         ttk.Button(top, text="Info", command=self.load_device_info).pack(side="left", padx=6)
         ttk.Button(top, text="Reboot", command=lambda: self.device_reboot("reboot")).pack(side="left")
         ttk.Button(top, text="Recovery", command=lambda: self.device_reboot("recovery")).pack(side="left", padx=6)
         ttk.Button(top, text="Bootloader", command=lambda: self.device_reboot("bootloader")).pack(side="left")
+        ttk.Button(top, text="Root", command=self.device_root).pack(side="left", padx=(6, 0))
 
         ttk.Label(top, textvariable=self.status_var, anchor="e").pack(side="right", fill="x", expand=True)
 
@@ -790,7 +830,7 @@ class ADBGui(tk.Tk):
         frame.pack(fill="x")
 
         ttk.Label(frame, text="APK file:").grid(row=0, column=0, sticky="w")
-        self.apk_path_var = tk.StringVar()
+        self.apk_path_var = tk.StringVar(value=self.settings.get("apk_path", ""))
         ttk.Entry(frame, textvariable=self.apk_path_var).grid(row=0, column=1, sticky="ew", padx=8)
         ttk.Button(frame, text="Browse", command=self.browse_apk).grid(row=0, column=2)
 
@@ -808,6 +848,8 @@ class ADBGui(tk.Tk):
 
         frame.columnconfigure(1, weight=1)
 
+        self.apk_progress_frame, self.apk_progress_var = self._create_operation_progress_area(self.tab_apk)
+
         self.apk_output = ScrolledText(self.tab_apk, wrap="word")
         self.apk_output.pack(fill="both", expand=True, pady=(10, 0))
 
@@ -816,13 +858,13 @@ class ADBGui(tk.Tk):
         top.pack(fill="x")
 
         ttk.Label(top, text="Local path:").grid(row=0, column=0, sticky="w")
-        self.local_path_var = tk.StringVar()
+        self.local_path_var = tk.StringVar(value=self.settings.get("local_path", ""))
         ttk.Entry(top, textvariable=self.local_path_var).grid(row=0, column=1, sticky="ew", padx=8)
         ttk.Button(top, text="Browse File", command=self.browse_local_file).grid(row=0, column=2)
         ttk.Button(top, text="Browse Folder", command=self.browse_local_folder).grid(row=0, column=3, padx=(6, 0))
 
         ttk.Label(top, text="Remote path:").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        self.remote_path_var = tk.StringVar(value="/sdcard/")
+        self.remote_path_var = tk.StringVar(value=self.settings.get("remote_path", "/sdcard/"))
         ttk.Entry(top, textvariable=self.remote_path_var).grid(row=1, column=1, sticky="ew", padx=8, pady=(8, 0))
         ttk.Button(top, text="Push", command=self.push_file).grid(row=1, column=2, pady=(8, 0))
         ttk.Button(top, text="Pull", command=self.pull_file).grid(row=1, column=3, padx=(6, 0), pady=(8, 0))
@@ -834,7 +876,7 @@ class ADBGui(tk.Tk):
         nav = ttk.Frame(browser)
         nav.pack(fill="x")
         ttk.Label(nav, text="Current folder:").pack(side="left")
-        self.remote_browser_path_var = tk.StringVar(value="/sdcard/")
+        self.remote_browser_path_var = tk.StringVar(value=self.settings.get("remote_browser_path", "/sdcard/"))
         self.remote_browser_entry = ttk.Entry(nav, textvariable=self.remote_browser_path_var)
         self.remote_browser_entry.pack(side="left", fill="x", expand=True, padx=8)
         self.remote_browser_entry.bind("<Return>", lambda e: self.remote_go_to_path())
@@ -846,6 +888,7 @@ class ADBGui(tk.Tk):
         action_bar.pack(fill="x", pady=(8, 8))
         ttk.Button(action_bar, text="Pull Selected", command=self.pull_selected_remote).pack(side="left")
         ttk.Button(action_bar, text="Use Selected Path", command=self.use_selected_remote_path).pack(side="left", padx=6)
+        ttk.Button(action_bar, text="Open Selected Folder", command=self.open_selected_remote_folder).pack(side="left", padx=(0, 6))
         ttk.Button(action_bar, text="Push Local to Current Folder", command=self.push_to_current_remote).pack(side="left")
 
         tree_frame = ttk.Frame(browser)
@@ -865,10 +908,13 @@ class ADBGui(tk.Tk):
         tree_scroll_x.grid(row=1, column=0, sticky="ew")
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
+        self.remote_tree.bind("<<TreeviewSelect>>", self._on_remote_item_selected)
         self.remote_tree.bind("<Double-1>", self._on_remote_item_activated)
+        self.remote_tree.bind("<Return>", self._on_remote_item_activated)
 
         output_frame = ttk.LabelFrame(self.tab_files, text="File Operations Output", padding=10)
         output_frame.pack(fill="both", expand=True, pady=(10, 0))
+        self.files_progress_frame, self.files_progress_var = self._create_operation_progress_area(output_frame)
         self.files_output = ScrolledText(output_frame, wrap="word")
         self.files_output.pack(fill="both", expand=True)
 
@@ -876,11 +922,11 @@ class ADBGui(tk.Tk):
         controls = ttk.Frame(self.tab_logcat)
         controls.pack(fill="x")
         ttk.Label(controls, text="Filter:").pack(side="left")
-        self.logcat_filter_var = tk.StringVar(value="")
+        self.logcat_filter_var = tk.StringVar(value=self.settings.get("logcat_filter", ""))
         ttk.Entry(controls, textvariable=self.logcat_filter_var).pack(side="left", fill="x", expand=True, padx=8)
-        self.logcat_timestamp_var = tk.BooleanVar(value=False)
+        self.logcat_timestamp_var = tk.BooleanVar(value=bool(self.settings.get("logcat_timestamp", False)))
         ttk.Checkbutton(controls, text="Prefix host timestamp", variable=self.logcat_timestamp_var).pack(side="left", padx=(0, 8))
-        self.logcat_auto_reconnect_var = tk.BooleanVar(value=True)
+        self.logcat_auto_reconnect_var = tk.BooleanVar(value=bool(self.settings.get("logcat_auto_reconnect", True)))
         ttk.Checkbutton(controls, text="Auto reconnect same device", variable=self.logcat_auto_reconnect_var).pack(side="left", padx=(0, 8))
         ttk.Button(controls, text="Start", command=self.start_logcat).pack(side="left")
         ttk.Button(controls, text="Stop", command=self.stop_logcat).pack(side="left", padx=6)
@@ -907,10 +953,11 @@ class ADBGui(tk.Tk):
         ttk.Button(frame, text="adb connect", command=self.connect_wireless).grid(row=2, column=2, sticky="w")
 
         ttk.Label(frame, text="TCP/IP Port").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        self.tcpip_port_var = tk.StringVar(value="5555")
+        self.tcpip_port_var = tk.StringVar(value=self.settings.get("tcpip_port", "5555"))
         ttk.Entry(frame, textvariable=self.tcpip_port_var, width=10).grid(row=3, column=1, sticky="w", padx=8, pady=(8, 0))
         ttk.Button(frame, text="Enable adb tcpip", command=self.enable_tcpip).grid(row=3, column=2, sticky="w", pady=(8, 0))
 
+        self.capture_progress_frame, self.capture_progress_var = self._create_operation_progress_area(self.tab_capture)
         self.capture_output = ScrolledText(self.tab_capture, wrap="word")
         self.capture_output.pack(fill="both", expand=True, pady=(10, 0))
 
@@ -958,7 +1005,7 @@ class ADBGui(tk.Tk):
         adb_frame.pack(fill="x")
 
         ttk.Label(adb_frame, text="Install folder:").grid(row=0, column=0, sticky="w")
-        self.installer_adb_dir_var = tk.StringVar(value=DEFAULT_INSTALL_DIR)
+        self.installer_adb_dir_var = tk.StringVar(value=self.settings.get("installer_adb_dir", DEFAULT_INSTALL_DIR))
         ttk.Entry(adb_frame, textvariable=self.installer_adb_dir_var).grid(row=0, column=1, sticky="ew", padx=8)
         ttk.Button(adb_frame, text="Browse", command=self.browse_platform_tools_dir).grid(row=0, column=2)
         ttk.Button(adb_frame, text="Check ADB", command=self.check_adb_status).grid(row=0, column=3, padx=(8, 0))
@@ -1135,6 +1182,96 @@ class ADBGui(tk.Tk):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def create_logcat_archive_from_files(self, archive_path, source_specs, serial_for_header: str, header_override: str = None):
+        """Create a .7z archive containing one or more log streams.
+
+        source_specs is a list of dictionaries with:
+          - path: source log file path
+          - suffix: internal filename suffix, e.g. "unfiltered" or "filtered"
+          - title: short stream description written below the export header
+        """
+        seven_zip = find_7zip_executable()
+        if not seven_zip:
+            raise RuntimeError("7-Zip was not found. Install 7-Zip or add 7z.exe to PATH before saving logs as .7z.")
+
+        usable_specs = []
+        for spec in source_specs or []:
+            source = Path(spec.get("path") or "")
+            # Keep zero-byte filtered logs in the archive. A filtered log with no
+            # matches is still useful because it proves the filter ran in parallel.
+            # Unfiltered logs may also be empty in very short sessions; include them
+            # when the file exists so the archive structure remains predictable.
+            if source.exists():
+                usable_specs.append({**spec, "path": source})
+
+        if not usable_specs:
+            raise RuntimeError("No log session files were available to archive.")
+
+        archive_path_obj = Path(archive_path)
+        archive_path_obj.parent.mkdir(parents=True, exist_ok=True)
+        temp_dir = Path(tempfile.mkdtemp(prefix="adb_gui_logcat_"))
+        internal_names = []
+
+        try:
+            header = header_override or self.logcat_cached_header or self.build_fallback_log_header(serial_for_header)
+            archive_path_obj.unlink(missing_ok=True)
+            used_names = set()
+            for spec in usable_specs:
+                suffix = self.sanitize_filename_part(spec.get("suffix", "log"), fallback="log")
+                internal_name = f"{archive_path_obj.stem}_{suffix}.txt"
+                # Keep internal names unique even if a caller accidentally repeats a suffix.
+                if internal_name in used_names:
+                    counter = 2
+                    base = internal_name[:-4]
+                    while f"{base}_{counter}.txt" in used_names:
+                        counter += 1
+                    internal_name = f"{base}_{counter}.txt"
+                used_names.add(internal_name)
+                internal_names.append(internal_name)
+                temp_log_path = temp_dir / internal_name
+                title = spec.get("title") or suffix
+                with temp_log_path.open("w", encoding="utf-8", errors="replace") as dst:
+                    dst.write(header)
+                    dst.write(f"Log stream: {title}\n")
+                    dst.write("-" * 80 + "\n")
+                    with spec["path"].open("r", encoding="utf-8", errors="replace") as src:
+                        shutil.copyfileobj(src, dst, length=1024 * 1024)
+
+            cmd = [
+                seven_zip,
+                "a",
+                "-t7z",
+                str(archive_path_obj),
+                *internal_names,
+                "-mx=9",
+                "-mmt=on",
+                "-y",
+            ]
+            res = run_quick(cmd, timeout=600, cwd=str(temp_dir))
+            if res.returncode != 0:
+                details = (res.stdout or "") + ("\n" if res.stdout and res.stderr else "") + (res.stderr or "")
+                raise RuntimeError(details.strip() or "7-Zip failed to create the archive.")
+            return archive_path_obj
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def build_logcat_source_specs(self, full_source_path=None, filtered_source_path=None, filter_description=None):
+        specs = []
+        if full_source_path:
+            specs.append({
+                "path": full_source_path,
+                "suffix": "unfiltered",
+                "title": "Full unfiltered ADB output captured before host-side filtering",
+            })
+        if filtered_source_path:
+            description = filter_description or self.logcat_filter_description or "host-side filter"
+            specs.append({
+                "path": filtered_source_path,
+                "suffix": "filtered",
+                "title": f"Host-filtered output ({description})",
+            })
+        return specs
+
     def auto_save_logcat_session(self, serial: str, reason: str = "disconnect"):
         content = self.logcat_output.get("1.0", tk.END)
         if not content or not content.strip():
@@ -1145,11 +1282,13 @@ class ADBGui(tk.Tk):
         self.create_logcat_archive(archive_path, content, serial_for_header=serial, header_override=header)
         return archive_path
 
-    def auto_save_logcat_session_async(self, serial: str, reason: str, content: str, header: str, source_log_path=None):
+    def auto_save_logcat_session_async(self, serial: str, reason: str, content: str, header: str, source_log_path=None, filtered_source_log_path=None, filter_description=None):
         source = Path(source_log_path) if source_log_path else None
-        has_source = bool(source and source.exists() and source.stat().st_size > 0)
+        filtered_source = Path(filtered_source_log_path) if filtered_source_log_path else None
+        source_specs = self.build_logcat_source_specs(source, filtered_source, filter_description=filter_description)
+        has_sources = any(Path(spec["path"]).exists() and Path(spec["path"]).stat().st_size > 0 for spec in source_specs)
         has_content = bool(content and content.strip())
-        if not has_source and not has_content:
+        if not has_sources and not has_content:
             self.enqueue_logcat_event({"event": "logcat_status", "message": "[auto save] No log content to save."})
             return
 
@@ -1157,21 +1296,25 @@ class ADBGui(tk.Tk):
             with self.logcat_save_lock:
                 try:
                     archive_path = self.build_automatic_logcat_archive_path(serial, suffix=f"logcat_{reason}")
-                    if has_source:
-                        self.create_logcat_archive_from_file(archive_path, source, serial_for_header=serial, header_override=header)
+                    if has_sources:
+                        self.create_logcat_archive_from_files(archive_path, source_specs, serial_for_header=serial, header_override=header)
                     else:
                         self.create_logcat_archive(archive_path, content, serial_for_header=serial, header_override=header)
-                    self.enqueue_logcat_event({"event": "logcat_status", "message": f"[auto save] Saved disconnected USB session to: {archive_path}"})
+                    pretty_reason = str(reason or "disconnect").replace("_", " ")
+                    self.enqueue_logcat_event({"event": "logcat_status", "message": f"[auto save] Saved {pretty_reason} session to: {archive_path}"})
                 except Exception as exc:
                     self.enqueue_logcat_event({"event": "logcat_status", "message": f"[auto save failed] {exc}"})
                 finally:
-                    if has_source and source == Path(self.logcat_session_file or ""):
+                    if source and source == Path(self.logcat_session_file or ""):
                         self.logcat_session_file = None
-                    try:
-                        if has_source:
-                            source.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                    if filtered_source and filtered_source == Path(self.logcat_filtered_session_file or ""):
+                        self.logcat_filtered_session_file = None
+                    for path in (source, filtered_source):
+                        try:
+                            if path:
+                                path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1242,21 +1385,314 @@ class ADBGui(tk.Tk):
     def format_logcat_line(self, line: str) -> str:
         return self.format_logcat_line_with_timestamp(line, self.logcat_timestamp_var.get())
 
-    def new_logcat_session_file(self, serial: str) -> Path:
+    @staticmethod
+    def build_logcat_filter_plan(filter_text: str):
+        """Return (adb_args, local_filter, description) for the Logcat filter box.
+
+        Older builds appended everything typed in the filter box to `adb logcat`.
+        That makes simple text searches such as `gps` behave like a logcat
+        filter-spec argument instead of a grep-style search, so it appears as
+        if filtering is broken. This planner keeps advanced logcat arguments
+        available while making the normal case a host-side filter that is
+        independent of Android shell `grep` availability.
+        """
+        text = (filter_text or "").strip()
+        if not text:
+            return [], None, "no filter"
+
+        lowered = text.lower()
+        if lowered.startswith(("adb:", "args:")):
+            raw = text.split(":", 1)[1].strip()
+            return split_user_args(raw), None, f"adb logcat args: {raw}"
+
+        if lowered.startswith("regex:"):
+            pattern = text.split(":", 1)[1].strip()
+            if not pattern:
+                raise ValueError("regex: filter requires a pattern.")
+            compiled = re.compile(pattern, re.IGNORECASE)
+            return [], {"mode": "regex", "pattern": pattern, "compiled": compiled}, f"host regex: {pattern}"
+
+        if lowered.startswith(("text:", "contains:")):
+            needle = text.split(":", 1)[1].strip()
+            if not needle:
+                raise ValueError("text: filter requires search text.")
+            return [], {"mode": "text", "text": needle.lower(), "display": needle}, f"host text: {needle}"
+
+        # Pass through explicit logcat options/filter-specs. Examples:
+        #   -v time -b main
+        #   MyTag:D *:S
+        # For ordinary words such as gps, location, camera, etc., use a local
+        # text filter so it works like users expect from grep/search.
+        tokens = split_user_args(text)
+        priority_spec = re.compile(r"^(?:\*|[A-Za-z0-9_.\-$]+):[VDIWEFSvdiewfs]$")
+        looks_like_adb_filter = bool(tokens) and (
+            tokens[0].startswith("-") or any(priority_spec.match(tok) for tok in tokens)
+        )
+        if looks_like_adb_filter:
+            return tokens, None, f"adb logcat args: {text}"
+
+        return [], {"mode": "text", "text": text.lower(), "display": text}, f"host text: {text}"
+
+    @staticmethod
+    def logcat_line_matches_filter(line: str, local_filter) -> bool:
+        if not local_filter:
+            return True
+        mode = local_filter.get("mode")
+        if mode == "regex":
+            return local_filter["compiled"].search(line) is not None
+        if mode == "text":
+            return local_filter["text"] in line.lower()
+        return True
+
+    def new_logcat_session_file(self, serial: str, kind: str = "unfiltered") -> Path:
         safe_serial = self.sanitize_filename_part(serial, fallback="unknown_device")
+        safe_kind = self.sanitize_filename_part(kind, fallback="log")
         temp_dir = Path(tempfile.gettempdir())
-        path = temp_dir / f"adb_gui_{safe_serial}_{os.getpid()}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log"
+        path = temp_dir / f"adb_gui_{safe_serial}_{safe_kind}_{os.getpid()}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log"
         path.write_text("", encoding="utf-8")
         return path
 
     def cleanup_logcat_session_file(self):
-        path = self.logcat_session_file
+        paths = [self.logcat_session_file, self.logcat_filtered_session_file]
         self.logcat_session_file = None
-        if path:
+        self.logcat_filtered_session_file = None
+        self.logcat_filter_text = ""
+        for path in paths:
+            if path:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+
+    # ---------- persistent settings ----------
+    @staticmethod
+    def default_settings_path() -> Path:
+        if is_windows():
+            base = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))) / SETTINGS_APP_DIR_NAME
+        else:
+            base = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "adb-control-center"
+        return base / "settings.json"
+
+    def load_settings(self) -> dict:
+        path = self.default_settings_path()
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return {"schema_version": SETTINGS_SCHEMA_VERSION}
+
+    def save_current_settings(self):
+        if not getattr(self, "_settings_ready", False):
+            return
+        try:
+            data = dict(getattr(self, "settings", {}) or {})
+            data["schema_version"] = SETTINGS_SCHEMA_VERSION
+            data["app_version"] = APP_VERSION
+            data["window_geometry"] = self.geometry()
+            data["last_selected_device_serial"] = self._selected_serial_value_or_empty()
+            if hasattr(self, "apk_path_var"):
+                data["apk_path"] = self.apk_path_var.get()
+            if hasattr(self, "local_path_var"):
+                data["local_path"] = self.local_path_var.get()
+            if hasattr(self, "remote_path_var"):
+                data["remote_path"] = self.remote_path_var.get()
+            if hasattr(self, "remote_browser_path_var"):
+                data["remote_browser_path"] = self.remote_browser_path_var.get()
+            if hasattr(self, "installer_adb_dir_var"):
+                data["installer_adb_dir"] = self.installer_adb_dir_var.get()
+            if hasattr(self, "tcpip_port_var"):
+                data["tcpip_port"] = self.tcpip_port_var.get()
+            if hasattr(self, "logcat_filter_var"):
+                data["logcat_filter"] = self.logcat_filter_var.get()
+            if hasattr(self, "logcat_timestamp_var"):
+                data["logcat_timestamp"] = bool(self.logcat_timestamp_var.get())
+            if hasattr(self, "logcat_auto_reconnect_var"):
+                data["logcat_auto_reconnect"] = bool(self.logcat_auto_reconnect_var.get())
+            path = self.default_settings_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = path.with_suffix(".tmp")
+            temp_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+            temp_path.replace(path)
+            self.settings = data
+        except Exception as exc:
             try:
-                Path(path).unlink(missing_ok=True)
+                self.append_dashboard_output("Save Settings", f"Could not save settings: {exc}")
             except Exception:
                 pass
+
+    def schedule_settings_save(self, delay_ms=600):
+        if self._closing or not getattr(self, "_settings_ready", False):
+            return
+        try:
+            if self._settings_save_after_id:
+                self.after_cancel(self._settings_save_after_id)
+        except Exception:
+            pass
+        try:
+            self._settings_save_after_id = self.after(delay_ms, self.save_current_settings)
+        except Exception:
+            pass
+
+    def _bind_settings_autosave(self):
+        traced = [
+            getattr(self, "apk_path_var", None),
+            getattr(self, "local_path_var", None),
+            getattr(self, "remote_path_var", None),
+            getattr(self, "remote_browser_path_var", None),
+            getattr(self, "installer_adb_dir_var", None),
+            getattr(self, "tcpip_port_var", None),
+            getattr(self, "logcat_filter_var", None),
+            getattr(self, "logcat_timestamp_var", None),
+            getattr(self, "logcat_auto_reconnect_var", None),
+        ]
+        for var in [v for v in traced if v is not None]:
+            try:
+                var.trace_add("write", lambda *_: self.schedule_settings_save())
+            except Exception:
+                pass
+        try:
+            self.bind("<Configure>", self._on_configure_for_settings, add="+")
+        except Exception:
+            pass
+
+    def _on_configure_for_settings(self, event=None):
+        # Only save the root window geometry, not every child widget configure event.
+        if event is not None and getattr(event, "widget", None) is not self:
+            return
+        self.schedule_settings_save(delay_ms=1200)
+
+    def _selected_serial_value_or_empty(self) -> str:
+        try:
+            value = self.selected_serial.get().strip()
+            return value.split(" | ")[0] if value else ""
+        except Exception:
+            return ""
+
+    def _on_device_combo_selected(self, _event=None):
+        self.schedule_settings_save(delay_ms=100)
+
+    # ---------- progress/cancel operations ----------
+    def _create_operation_progress_area(self, parent):
+        frame = ttk.Frame(parent)
+        frame.pack(fill="x", pady=(8, 0))
+        label_var = tk.StringVar(value="No long operation running.")
+        ttk.Label(frame, textvariable=label_var).pack(side="left")
+        bar = ttk.Progressbar(frame, mode="indeterminate", length=180)
+        bar.pack(side="left", padx=8)
+        cancel_btn = ttk.Button(frame, text="Cancel", command=self.cancel_active_operation, state="disabled")
+        cancel_btn.pack(side="left")
+        frame._progress_bar = bar
+        frame._cancel_button = cancel_btn
+        return frame, label_var
+
+    def _set_progress_area(self, frame, var, running: bool, text: str):
+        try:
+            var.set(text)
+            if running:
+                frame._progress_bar.start(12)
+                frame._cancel_button.configure(state="normal")
+            else:
+                frame._progress_bar.stop()
+                frame._cancel_button.configure(state="disabled")
+        except Exception:
+            pass
+
+    def cancel_active_operation(self):
+        self._active_operation_cancel_requested = True
+        proc = self._active_operation_proc
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self.set_status("Cancel requested")
+
+    def run_cancellable_adb_operation(self, label, adb_args, serial=None, timeout=1200, widget=None, progress_frame=None, progress_var=None, on_success=None):
+        target_widget = widget if widget is not None else self.dashboard_output
+        if self._active_operation_proc is not None and self._active_operation_proc.poll() is None:
+            messagebox.showwarning(APP_TITLE, "Another cancellable ADB operation is already running. Cancel it or wait for it to finish first.")
+            return
+
+        progress_frame = progress_frame or getattr(self, "files_progress_frame", None)
+        progress_var = progress_var or getattr(self, "files_progress_var", None)
+        self._active_operation_cancel_requested = False
+        if progress_frame and progress_var:
+            self._set_progress_area(progress_frame, progress_var, True, f"Running: {label}")
+
+        def worker():
+            output = ""
+            try:
+                self.ui_call(lambda l=label: self.set_status(f"Running: {l}"))
+                self.ui_call(lambda l=label: self.append_text(target_widget, f"\n>>> Running: {l}"))
+                cmd = self.manager.adb_cmd(*adb_args, serial=serial)
+                creationflags = subprocess.CREATE_NO_WINDOW if is_windows() and hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    creationflags=creationflags,
+                )
+                self._active_operation_proc = proc
+                deadline = time.monotonic() + timeout if timeout else None
+                while True:
+                    try:
+                        out, _ = proc.communicate(timeout=0.25)
+                        output += out or ""
+                        break
+                    except subprocess.TimeoutExpired:
+                        if self._active_operation_cancel_requested:
+                            try:
+                                proc.terminate()
+                                proc.wait(timeout=5)
+                            except Exception:
+                                try:
+                                    proc.kill()
+                                except Exception:
+                                    pass
+                            raise RuntimeError("Operation canceled by user.")
+                        if deadline and time.monotonic() > deadline:
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                            raise RuntimeError(f"Operation timed out after {timeout} seconds.")
+                if proc.returncode != 0:
+                    raise RuntimeError(output.strip() or f"ADB operation failed with exit code {proc.returncode}.")
+                extra = ""
+                if on_success:
+                    extra_result = on_success(output)
+                    extra = str(extra_result or "")
+                final_output = output.strip() or "Command completed with no output."
+                if extra.strip():
+                    final_output += "\n" + extra.strip()
+                self.ui_call(lambda o=final_output: self.append_text(target_widget, o))
+                if target_widget is not self.dashboard_output:
+                    self.ui_call(lambda l=label, o=final_output: self.append_dashboard_output(l, o))
+                self.ui_call(lambda: self.set_status("Ready"))
+            except Exception as exc:
+                self.ui_call(lambda: self.set_status("Error"))
+                self.ui_call(lambda e=exc: self.append_text(target_widget, f"ERROR: {e}"))
+                if target_widget is not self.dashboard_output:
+                    self.ui_call(lambda l=label, e=exc: self.append_dashboard_output(l, f"ERROR: {e}"))
+                self.ui_call(lambda e=exc: messagebox.showerror(APP_TITLE, str(e)))
+            finally:
+                self._active_operation_proc = None
+                self._active_operation_cancel_requested = False
+                if progress_frame and progress_var:
+                    self.ui_call(lambda: self._set_progress_area(progress_frame, progress_var, False, "No long operation running."))
+                self.ui_call(lambda: self.schedule_settings_save(delay_ms=100))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ---------- helpers ----------
     def set_status(self, text):
@@ -1725,12 +2161,15 @@ class ADBGui(tk.Tk):
             current_value = self.selected_serial.get().strip()
             if current_value:
                 previous_serial = current_value.split(" | ")[0]
+            if not previous_serial:
+                previous_serial = self.settings.get("last_selected_device_serial", "")
             self.devices = devices
             values = self._device_values()
             self.device_combo["values"] = values
             if values:
                 matched = next((v for v in values if v.split(" | ")[0] == previous_serial), values[0])
                 self.selected_serial.set(matched)
+                self.schedule_settings_save(delay_ms=100)
             else:
                 self.selected_serial.set("")
             self.set_status(f"Devices: {len(values)}")
@@ -1770,11 +2209,13 @@ class ADBGui(tk.Tk):
                 self.ui_call(lambda: self.clear_text(self.adb_status_text))
                 self.ui_call(lambda e=exc: self.append_text(self.adb_status_text, f"ADB not available: {e}"))
                 self.ui_call(lambda e=exc: self.append_dashboard_output("Refresh Devices", f"ADB not available: {e}", command="adb devices -l"))
-                self.devices = []
-                self.ui_call(lambda: self.device_combo.configure(values=[]))
-                self.ui_call(lambda: self.selected_serial.set(""))
-                self.ui_call(lambda: self.remote_tree.delete(*self.remote_tree.get_children()))
-                self.remote_entries = []
+                def clear_device_state():
+                    self.devices = []
+                    self.device_combo.configure(values=[])
+                    self.selected_serial.set("")
+                    self.remote_tree.delete(*self.remote_tree.get_children())
+                    self.remote_entries = []
+                self.ui_call(clear_device_state)
 
         threading.Thread(target=bg, daemon=True).start()
 
@@ -1820,15 +2261,114 @@ class ADBGui(tk.Tk):
 
         threading.Thread(target=bg, daemon=True).start()
 
+    def run_adb_reboot_no_hang(self, serial: str, mode: str, timeout: int = 12) -> str:
+        args = ["reboot"] if mode == "reboot" else ["reboot", mode]
+        cmd = self.manager.adb_cmd(*args, serial=serial)
+        creationflags = 0
+        if is_windows() and hasattr(subprocess, "CREATE_NO_WINDOW"):
+            creationflags |= subprocess.CREATE_NO_WINDOW
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=creationflags,
+        )
+        try:
+            output, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return f"Reboot command sent to {serial}. ADB did not exit within {timeout}s, so the helper process was killed to keep the GUI responsive."
+        output = (output or "").strip()
+        if proc.returncode not in (0, None):
+            # Reboot often disconnects the device before adb prints a clean success.
+            # Treat the command as sent, but keep the diagnostic text visible.
+            if output:
+                return f"Reboot command sent to {serial}. ADB returned {proc.returncode}:\n{output}"
+            return f"Reboot command sent to {serial}. ADB returned {proc.returncode} after device disconnect."
+        return output or (f"Reboot command sent to {serial}." if mode == "reboot" else f"Reboot to {mode} command sent to {serial}.")
+
+    def run_adb_root_no_hang(self, serial: str, timeout: int = 12) -> str:
+        cmd = self.manager.adb_cmd("root", serial=serial)
+        creationflags = 0
+        if is_windows() and hasattr(subprocess, "CREATE_NO_WINDOW"):
+            creationflags |= subprocess.CREATE_NO_WINDOW
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=creationflags,
+        )
+        try:
+            output, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return (
+                f"ADB root command was sent to {serial}, but adb did not exit within "
+                f"{timeout}s. The helper process was killed to keep the GUI responsive. "
+                "The device may still be restarting adbd."
+            )
+
+        output = (output or "").strip()
+        if proc.returncode not in (0, None):
+            details = output or "No output returned by adb."
+            return f"ADB root returned exit code {proc.returncode} for {serial}:\n{details}"
+        return output or f"ADB root command sent to {serial}."
+
+    def device_root(self):
+        serial = self.require_selected_device()
+        if not serial:
+            return
+
+        if self.is_logcat_running() and self.logcat_active_serial == serial:
+            self.logcat_expected_reboot_serial = serial
+            self.logcat_expected_reboot_mode = "root"
+            self.enqueue_logcat_event({
+                "event": "logcat_status",
+                "message": (
+                    f"[logcat] ADB root requested for {serial}; adbd may restart. "
+                    "If Logcat disconnects, the current session will be auto-saved "
+                    "and the app will try to resume on the same serial."
+                ),
+            })
+
+        def worker():
+            return self.run_adb_root_no_hang(serial)
+
+        self.run_background_action("adb root", worker, widget=self.dashboard_output)
+
     def device_reboot(self, mode):
         serial = self.require_selected_device()
         if not serial:
             return
 
+        if mode in {"reboot", "recovery", "bootloader"} and self.is_logcat_running() and self.logcat_active_serial == serial:
+            self.logcat_expected_reboot_serial = serial
+            self.logcat_expected_reboot_mode = mode
+            self.enqueue_logcat_event({
+                "event": "logcat_status",
+                "message": f"[logcat] Reboot mode '{mode}' requested for {serial}; treating the next disconnect as expected and auto-resuming when the same Android serial returns.",
+            })
+
         def worker():
-            if mode == "reboot":
-                return self.manager.run_adb("reboot", serial=serial) or f"Reboot command sent to {serial}."
-            return self.manager.run_adb("reboot", mode, serial=serial) or f"Reboot to {mode} command sent to {serial}."
+            try:
+                return self.run_adb_reboot_no_hang(serial, mode)
+            except Exception:
+                if serial == self.logcat_expected_reboot_serial:
+                    self.logcat_expected_reboot_serial = None
+                    self.logcat_expected_reboot_mode = None
+                raise
 
         self.run_background_action(f"reboot {mode}", worker, widget=self.dashboard_output)
 
@@ -1862,25 +2402,21 @@ class ADBGui(tk.Tk):
             messagebox.showwarning(APP_TITLE, "Select a valid APK file.")
             return
 
-        reinstall = self.apk_reinstall_var.get()
-        grant_permissions = self.apk_grant_var.get()
-
-        def worker():
-            cmd = [self.manager.require_adb()]
-            if serial:
-                cmd += ["-s", serial]
-            cmd += ["install"]
-            if reinstall:
-                cmd.append("-r")
-            if grant_permissions:
-                cmd.append("-g")
-            cmd.append(apk_path)
-            res = run_quick(cmd, timeout=600)
-            if res.returncode != 0:
-                raise RuntimeError(res.stderr.strip() or res.stdout.strip() or "APK install failed")
-            return res.stdout.strip() or "APK installed successfully."
-
-        self.run_background_action("install apk", worker, widget=self.apk_output)
+        args = ["install"]
+        if self.apk_reinstall_var.get():
+            args.append("-r")
+        if self.apk_grant_var.get():
+            args.append("-g")
+        args.append(apk_path)
+        self.run_cancellable_adb_operation(
+            "install APK",
+            args,
+            serial=serial,
+            timeout=1800,
+            widget=self.apk_output,
+            progress_frame=self.apk_progress_frame,
+            progress_var=self.apk_progress_var,
+        )
 
     def uninstall_package(self):
         serial = self.require_selected_device()
@@ -1924,10 +2460,15 @@ class ADBGui(tk.Tk):
             messagebox.showwarning(APP_TITLE, "Enter a remote path.")
             return
 
-        def worker():
-            return self.manager.run_adb("push", local_path, remote_path, serial=serial, timeout=1200)
-
-        self.run_background_action("adb push", worker, widget=self.files_output)
+        self.run_cancellable_adb_operation(
+            "adb push",
+            ["push", local_path, remote_path],
+            serial=serial,
+            timeout=3600,
+            widget=self.files_output,
+            progress_frame=self.files_progress_frame,
+            progress_var=self.files_progress_var,
+        )
 
     def pull_file(self):
         serial = self.require_selected_device()
@@ -1941,10 +2482,15 @@ class ADBGui(tk.Tk):
         if not local_path:
             return
 
-        def worker():
-            return self.manager.run_adb("pull", remote_path, local_path, serial=serial, timeout=1200)
-
-        self.run_background_action("adb pull", worker, widget=self.files_output)
+        self.run_cancellable_adb_operation(
+            "adb pull",
+            ["pull", remote_path, local_path],
+            serial=serial,
+            timeout=3600,
+            widget=self.files_output,
+            progress_frame=self.files_progress_frame,
+            progress_var=self.files_progress_var,
+        )
 
     def remote_go_home(self):
         self.remote_browser_path_var.set("/sdcard/")
@@ -2011,14 +2557,40 @@ class ADBGui(tk.Tk):
             "path": path,
         }
 
-    def _on_remote_item_activated(self, _event=None):
+    def _on_remote_item_selected(self, _event=None):
+        """Mirror the selected remote item into the Remote path field.
+
+        Selection should be non-destructive: it updates the operation target, but
+        it does not automatically navigate away. Folder navigation is handled by
+        double-click, Enter, Open Selected Folder, or Use Selected Path.
+        """
         item = self._selected_remote_item()
         if not item:
             return
         self.remote_path_var.set(item["path"])
         if item["is_dir"]:
-            self.remote_browser_path_var.set(item["path"])
-            self.refresh_remote_files()
+            self.set_status(f"Selected remote folder: {item['path']}")
+        else:
+            self.set_status(f"Selected remote file: {item['path']}")
+
+    def open_selected_remote_folder(self):
+        """Navigate into the selected remote folder and refresh the listing."""
+        item = self._selected_remote_item()
+        if not item:
+            messagebox.showwarning(APP_TITLE, "Select a remote folder first.")
+            return
+        self.remote_path_var.set(item["path"])
+        if not item["is_dir"]:
+            messagebox.showwarning(APP_TITLE, "The selected item is a file. Select a folder to open it in the browser.")
+            self.set_status(f"Selected remote file: {item['path']}")
+            return
+        self.remote_browser_path_var.set(item["path"])
+        self.set_status(f"Opening remote folder: {item['path']}")
+        self.refresh_remote_files()
+
+    def _on_remote_item_activated(self, _event=None):
+        # Double-click or Enter should open directories just like a normal file browser.
+        self.open_selected_remote_folder()
 
     def use_selected_remote_path(self):
         item = self._selected_remote_item()
@@ -2026,7 +2598,16 @@ class ADBGui(tk.Tk):
             messagebox.showwarning(APP_TITLE, "Select a remote file or folder first.")
             return
         self.remote_path_var.set(item["path"])
-        self.set_status(f"Selected remote path: {item['path']}")
+        if item["is_dir"]:
+            # Previous behavior only copied the folder to the Remote path field.
+            # That made the browser look stale: Current folder stayed on the
+            # parent and the list did not refresh. For a directory selection,
+            # treat Use Selected Path as an explicit request to enter that folder.
+            self.remote_browser_path_var.set(item["path"])
+            self.set_status(f"Opening remote folder: {item['path']}")
+            self.refresh_remote_files()
+        else:
+            self.set_status(f"Selected remote path: {item['path']}")
 
     def pull_selected_remote(self):
         item = self._selected_remote_item()
@@ -2094,9 +2675,10 @@ class ADBGui(tk.Tk):
                 visible_seed = ""
         flt = self.logcat_filter_var.get().strip()
         try:
+            adb_filter_args, local_filter, filter_description = self.build_logcat_filter_plan(flt)
             cmd = self.manager.adb_cmd("logcat", serial=serial)
-            if flt:
-                cmd.extend(split_user_args(flt))
+            if adb_filter_args:
+                cmd.extend(adb_filter_args)
         except Exception as exc:
             if reconnecting:
                 self.enqueue_logcat_event({"event": "logcat_status", "message": f"[auto reconnect failed to build logcat command] {exc}"})
@@ -2104,6 +2686,48 @@ class ADBGui(tk.Tk):
                 messagebox.showerror(APP_TITLE, str(exc))
                 self.set_status("Error")
             return
+
+        # Create the temporary session spool before launching adb. The reader
+        # writes every line emitted by adb into this file immediately, before
+        # applying any host-side display filter. This prevents UI throttling or
+        # local filters from losing the complete captured log session.
+        #
+        # Append Session must preserve the existing full spool file. Older builds
+        # recreated the spool from only the visible Text widget; under heavy logs
+        # the visible widget may intentionally drop lines while the full spool keeps
+        # them. Reusing the spool here avoids losing hidden/drop-throttled lines.
+        append_mode = bool(self.logcat_next_start_seed_visible and not self.logcat_next_start_clear_visible)
+        previous_session_file = self.logcat_session_file
+        previous_filtered_file = self.logcat_filtered_session_file
+        previous_filter_text = getattr(self, "logcat_filter_text", "")
+
+        reuse_full_spool = append_mode and previous_session_file and Path(previous_session_file).exists()
+        session_file_path = str(previous_session_file) if reuse_full_spool else str(self.new_logcat_session_file(serial, kind="unfiltered"))
+
+        reuse_filtered_spool = (
+            append_mode
+            and local_filter
+            and previous_filtered_file
+            and Path(previous_filtered_file).exists()
+            and previous_filter_text == flt
+        )
+        if local_filter:
+            filtered_session_file_path = str(previous_filtered_file) if reuse_filtered_spool else str(self.new_logcat_session_file(serial, kind="filtered"))
+        else:
+            filtered_session_file_path = None
+
+        # Clean up stale previous files only after deciding what is being reused.
+        # Never delete the reused full spool; it may contain lines that are no
+        # longer visible in the UI.
+        for stale_path in (previous_session_file, previous_filtered_file):
+            if not stale_path:
+                continue
+            if stale_path in {session_file_path, filtered_session_file_path}:
+                continue
+            try:
+                Path(stale_path).unlink(missing_ok=True)
+            except Exception:
+                pass
 
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if is_windows() else 0
         try:
@@ -2118,6 +2742,12 @@ class ADBGui(tk.Tk):
                 creationflags=creationflags,
             )
         except Exception as exc:
+            for path in (session_file_path, filtered_session_file_path):
+                try:
+                    if path:
+                        Path(path).unlink(missing_ok=True)
+                except Exception:
+                    pass
             if reconnecting:
                 self.enqueue_logcat_event({"event": "logcat_status", "message": f"[auto reconnect failed to start logcat] {exc}"})
             else:
@@ -2131,37 +2761,75 @@ class ADBGui(tk.Tk):
         self.logcat_active_serial = serial
         self.logcat_target_serial = serial
         self.logcat_stop_requested = False
-        self.cleanup_logcat_session_file()
-        self.logcat_session_file = str(self.new_logcat_session_file(serial))
+        self.logcat_session_file = session_file_path
+        self.logcat_filtered_session_file = filtered_session_file_path
+        self.logcat_filter_description = filter_description
+        self.logcat_filter_text = flt
         self.logcat_session_timestamp_enabled = self.logcat_timestamp_var.get()
         if self.logcat_pending_new_session or self.logcat_next_start_clear_visible:
             self.clear_logcat_output()
             self.logcat_pending_new_session = False
-        elif visible_seed and visible_seed.strip():
+        elif visible_seed and visible_seed.strip() and not reuse_full_spool:
             try:
-                with open(self.logcat_session_file, "a", encoding="utf-8", errors="replace") as seed_log:
-                    seed_log.write(visible_seed)
-                    if not visible_seed.endswith("\n"):
-                        seed_log.write("\n")
+                seed_paths = [self.logcat_session_file, self.logcat_filtered_session_file]
+                for seed_path in [p for p in seed_paths if p]:
+                    with open(seed_path, "a", encoding="utf-8", errors="replace") as seed_log:
+                        seed_log.write(visible_seed)
+                        if not visible_seed.endswith("\n"):
+                            seed_log.write("\n")
             except Exception as exc:
                 self.enqueue_logcat_event({"event": "logcat_status", "message": f"[logcat append warning] Could not seed previous visible log into session file: {exc}"})
+        elif reuse_full_spool:
+            self.enqueue_logcat_event({"event": "logcat_status", "message": "[logcat append] Reusing the existing full spool file so hidden/drop-throttled lines are preserved."})
         self.logcat_next_start_clear_visible = False
         self.logcat_next_start_seed_visible = False
         self.prepare_logcat_header_async(serial)
+        self.enqueue_logcat_event({
+            "event": "logcat_status",
+            "message": f"[logcat spool] Capturing complete unfiltered ADB output to: {self.logcat_session_file}",
+        })
+        if self.logcat_filtered_session_file:
+            self.enqueue_logcat_event({
+                "event": "logcat_status",
+                "message": f"[logcat spool] Capturing host-filtered output in parallel to: {self.logcat_filtered_session_file}",
+            })
+        else:
+            self.enqueue_logcat_event({
+                "event": "logcat_status",
+                "message": "[logcat spool] No host-side text/regex filter active; only the unfiltered ADB output stream is spooled.",
+            })
 
-        def reader(proc_ref=proc, serial_ref=serial, session_file_ref=self.logcat_session_file, timestamp_enabled=self.logcat_session_timestamp_enabled, generation_ref=generation):
+        def reader(proc_ref=proc, serial_ref=serial, session_file_ref=self.logcat_session_file, filtered_file_ref=self.logcat_filtered_session_file, timestamp_enabled=self.logcat_session_timestamp_enabled, generation_ref=generation, local_filter_ref=local_filter):
             try:
                 stream = proc_ref.stdout
                 line_counter = 0
-                with open(session_file_ref, "a", encoding="utf-8", errors="replace") as session_log:
-                    if stream is not None:
-                        for line in stream:
-                            session_log.write(self.format_logcat_line_with_timestamp(line, timestamp_enabled))
-                            line_counter += 1
-                            if line_counter % 100 == 0:
-                                session_log.flush()
-                            self.enqueue_logcat_line(line)
-                    session_log.flush()
+                with open(session_file_ref, "a", encoding="utf-8", errors="replace", buffering=1) as session_log:
+                    filtered_log_cm = open(filtered_file_ref, "a", encoding="utf-8", errors="replace", buffering=1) if filtered_file_ref else None
+                    try:
+                        if stream is not None:
+                            for line in stream:
+                                # Always spool the complete adb-emitted stream first.
+                                # The host-side local filter only controls what is shown
+                                # in the GUI, not what is preserved on disk.
+                                formatted_line = self.format_logcat_line_with_timestamp(line, timestamp_enabled)
+                                session_log.write(formatted_line)
+                                line_counter += 1
+                                matched = self.logcat_line_matches_filter(line, local_filter_ref)
+                                if matched and filtered_log_cm is not None:
+                                    filtered_log_cm.write(formatted_line)
+                                if line_counter % LOGCAT_SPOOL_FLUSH_EVERY_LINES == 0:
+                                    session_log.flush()
+                                    if filtered_log_cm is not None:
+                                        filtered_log_cm.flush()
+                                if not matched:
+                                    continue
+                                self.enqueue_logcat_line(line)
+                        session_log.flush()
+                        if filtered_log_cm is not None:
+                            filtered_log_cm.flush()
+                    finally:
+                        if filtered_log_cm is not None:
+                            filtered_log_cm.close()
             except Exception as exc:
                 self.enqueue_logcat_event({"event": "logcat_status", "message": f"[logcat reader error] {exc}"})
             finally:
@@ -2178,6 +2846,8 @@ class ADBGui(tk.Tk):
 
         self.logcat_thread = threading.Thread(target=reader, daemon=True)
         self.logcat_thread.start()
+        if flt:
+            self.enqueue_logcat_event({"event": "logcat_status", "message": f"[logcat filter] {filter_description}"})
         if reconnecting:
             self.enqueue_logcat_event({"event": "logcat_status", "message": f"[auto reconnect] logcat resumed for {serial}"})
             self.set_status(f"Logcat reconnected: {serial}")
@@ -2197,32 +2867,69 @@ class ADBGui(tk.Tk):
             self.logcat_target_serial = None
             self.logcat_reconnect_running = False
             self.logcat_pending_new_session = False
+            self.logcat_expected_reboot_serial = None
+            self.logcat_expected_reboot_mode = None
             self.set_status("Logcat stopped")
             return
 
         if serial != self.logcat_target_serial:
             return
 
+        expected_reboot = bool(serial and serial == self.logcat_expected_reboot_serial)
+        expected_mode = self.logcat_expected_reboot_mode if expected_reboot else None
         is_usb_disconnect = serial and ":" not in serial
-        if is_usb_disconnect:
+        is_wireless_disconnect = serial and ":" in serial
+        source_log_path = self.logcat_session_file
+        filtered_source_log_path = self.logcat_filtered_session_file
+        session_has_files = any(Path(p).exists() and Path(p).stat().st_size > 0 for p in (source_log_path, filtered_source_log_path) if p)
+        if serial and session_has_files:
             content = self.logcat_output.get("1.0", tk.END)
             header = self.logcat_cached_header or self.build_fallback_log_header(serial)
-            source_log_path = self.logcat_session_file
-            # Detach the completed session file before the reconnect path starts.
-            # Otherwise a fast reconnect could delete this file when creating the
-            # next session, racing the background auto-save worker.
+            filter_description = self.logcat_filter_description
+            # Detach the completed session files before any reconnect path starts.
+            # Otherwise a fast reconnect can delete these files when creating the
+            # next session, racing the background auto-save worker. This is needed
+            # for USB and wireless sessions; older builds only protected USB.
             self.logcat_session_file = None
+            self.logcat_filtered_session_file = None
             self.clear_logcat_output()
             self.logcat_pending_new_session = True
-            self.enqueue_logcat_event({"event": "logcat_status", "message": "[auto save] USB disconnect detected. Saving closed log session in the background..."})
-            self.auto_save_logcat_session_async(serial, reason="usb_disconnect", content=content, header=header, source_log_path=source_log_path)
+            if expected_reboot:
+                expected_label = expected_mode or "reboot"
+                self.enqueue_logcat_event({"event": "logcat_status", "message": f"[auto save] Expected {expected_label} disconnect detected. Saving closed log session in the background..."})
+                save_reason = f"{self.sanitize_filename_part(expected_label, fallback='expected')}_disconnect"
+            elif is_usb_disconnect:
+                self.enqueue_logcat_event({"event": "logcat_status", "message": "[auto save] USB disconnect detected. Saving closed log session in the background..."})
+                save_reason = "usb_disconnect"
+            elif is_wireless_disconnect:
+                self.enqueue_logcat_event({"event": "logcat_status", "message": "[auto save] Wireless ADB/logcat disconnect detected. Saving closed log session in the background..."})
+                save_reason = "wireless_disconnect"
+            else:
+                self.enqueue_logcat_event({"event": "logcat_status", "message": "[auto save] Logcat exited unexpectedly. Saving closed log session in the background..."})
+                save_reason = "logcat_exit"
+            self.auto_save_logcat_session_async(
+                serial,
+                reason=save_reason,
+                content=content,
+                header=header,
+                source_log_path=source_log_path,
+                filtered_source_log_path=filtered_source_log_path,
+                filter_description=filter_description,
+            )
 
         self.set_status("Logcat disconnected")
-        self.append_text(self.logcat_output, f"[logcat disconnected] Device {serial} disconnected or logcat exited (code: {returncode}).")
+        if expected_reboot:
+            expected_label = expected_mode or "reboot"
+            self.append_text(self.logcat_output, f"[logcat] Expected {expected_label} disconnect for {serial}; waiting for the same Android serial to return.")
+        else:
+            self.append_text(self.logcat_output, f"[logcat disconnected] Device {serial} disconnected or logcat exited (code: {returncode}).")
 
         if self.logcat_auto_reconnect_var.get():
             self._start_logcat_reconnect(serial)
         else:
+            if expected_reboot:
+                self.logcat_expected_reboot_serial = None
+                self.logcat_expected_reboot_mode = None
             self.append_text(self.logcat_output, f"[logcat stopped] Auto reconnect is disabled for {serial}.")
 
     def _start_logcat_reconnect(self, serial):
@@ -2289,6 +2996,9 @@ class ADBGui(tk.Tk):
     def _resume_logcat_after_reconnect(self, serial):
         if self.logcat_stop_requested:
             return
+        if serial == self.logcat_expected_reboot_serial:
+            self.logcat_expected_reboot_serial = None
+            self.logcat_expected_reboot_mode = None
         self.refresh_devices()
         self.start_logcat(serial_override=serial, reconnecting=True)
 
@@ -2303,6 +3013,8 @@ class ADBGui(tk.Tk):
             self.logcat_target_serial = None
             self.logcat_reconnect_running = False
             self.logcat_pending_new_session = False
+            self.logcat_expected_reboot_serial = None
+            self.logcat_expected_reboot_mode = None
             self.set_status("Logcat not running")
             return
         try:
@@ -2320,6 +3032,8 @@ class ADBGui(tk.Tk):
             self.logcat_active_serial = None
             self.logcat_target_serial = None
             self.logcat_pending_new_session = False
+            self.logcat_expected_reboot_serial = None
+            self.logcat_expected_reboot_mode = None
         self.set_status("Logcat stopped")
 
     def save_logcat(self):
@@ -2347,12 +3061,20 @@ class ADBGui(tk.Tk):
 
         content = self.logcat_output.get("1.0", tk.END)
         source_log_path = self.logcat_session_file
+        filtered_source_log_path = self.logcat_filtered_session_file
+        filter_description = self.logcat_filter_description
         header = self.logcat_cached_header or self.build_fallback_log_header(serial_for_header)
 
         def worker():
             with self.logcat_save_lock:
-                if source_log_path and Path(source_log_path).exists() and Path(source_log_path).stat().st_size > 0:
-                    archive_path_obj = self.create_logcat_archive_from_file(archive_path, source_log_path, serial_for_header=serial_for_header, header_override=header)
+                source_specs = self.build_logcat_source_specs(
+                    source_log_path,
+                    filtered_source_log_path,
+                    filter_description=filter_description,
+                )
+                has_sources = any(Path(spec["path"]).exists() and Path(spec["path"]).stat().st_size > 0 for spec in source_specs)
+                if has_sources:
+                    archive_path_obj = self.create_logcat_archive_from_files(archive_path, source_specs, serial_for_header=serial_for_header, header_override=header)
                 else:
                     archive_path_obj = self.create_logcat_archive(archive_path, content, serial_for_header=serial_for_header, header_override=header)
                 return f"Saved logcat archive: {archive_path_obj}"
@@ -2409,6 +3131,15 @@ class ADBGui(tk.Tk):
         self.append_text(self.capture_output, f"Screenrecord started: {remote}")
         self.set_status("Screenrecord running")
 
+    def clear_screenrecord_state_if_current(self, remote_path=None, serial=None):
+        if remote_path is not None and self.screenrecord_remote not in (None, remote_path):
+            return
+        if serial is not None and self.screenrecord_serial not in (None, serial):
+            return
+        self.screenrecord_process = None
+        self.screenrecord_remote = None
+        self.screenrecord_serial = None
+
     def stop_screenrecord(self):
         proc = self.screenrecord_process
         if not proc or proc.poll() is not None:
@@ -2433,15 +3164,21 @@ class ADBGui(tk.Tk):
         remote_path = self.screenrecord_remote
         record_serial = self.screenrecord_serial
 
-        def worker():
-            self.manager.run_adb("pull", remote_path, dest, serial=record_serial, timeout=1200)
+        def cleanup_after_pull(_output):
             self.manager.run_adb("shell", "rm", remote_path, serial=record_serial, timeout=60)
+            self.ui_call(lambda rp=remote_path, rs=record_serial: self.clear_screenrecord_state_if_current(rp, rs))
             return f"Screenrecord saved to: {dest}"
 
-        self.run_background_action("pull screenrecord", worker, widget=self.capture_output)
-        self.screenrecord_process = None
-        self.screenrecord_remote = None
-        self.screenrecord_serial = None
+        self.run_cancellable_adb_operation(
+            "pull screenrecord",
+            ["pull", remote_path, dest],
+            serial=record_serial,
+            timeout=3600,
+            widget=self.capture_output,
+            progress_frame=self.capture_progress_frame,
+            progress_var=self.capture_progress_var,
+            on_success=cleanup_after_pull,
+        )
 
     def enable_tcpip(self):
         serial = self.require_selected_device()
@@ -2567,9 +3304,56 @@ class ADBGui(tk.Tk):
         self.run_background_action(f"adb {command}", worker, widget=self.raw_output)
 
     def on_close(self):
+        if self.is_logcat_running():
+            choice = messagebox.askyesnocancel(
+                APP_TITLE,
+                "Logcat is still running. Yes = save the current log session and exit. No = stop without saving and exit. Cancel = keep the app open.",
+            )
+            if choice is None:
+                return
+            if choice:
+                try:
+                    serial = self.logcat_active_serial or self.logcat_target_serial or self._selected_serial_value_or_empty() or "unknown_device"
+                    source_log_path = self.logcat_session_file
+                    filtered_source_log_path = self.logcat_filtered_session_file
+                    filter_description = self.logcat_filter_description
+                    header = self.logcat_cached_header or self.build_fallback_log_header(serial)
+                    content = self.logcat_output.get("1.0", tk.END)
+                    reader_thread = self.logcat_thread
+                    self.stop_logcat()
+                    try:
+                        if reader_thread:
+                            reader_thread.join(timeout=1.0)
+                    except Exception:
+                        pass
+                    archive_path = self.build_automatic_logcat_archive_path(serial, suffix="logcat_app_close")
+                    source_specs = self.build_logcat_source_specs(source_log_path, filtered_source_log_path, filter_description=filter_description)
+                    has_sources = any(Path(spec["path"]).exists() for spec in source_specs)
+                    if has_sources:
+                        self.create_logcat_archive_from_files(archive_path, source_specs, serial_for_header=serial, header_override=header)
+                    elif content.strip():
+                        self.create_logcat_archive(archive_path, content, serial_for_header=serial, header_override=header)
+                    messagebox.showinfo(APP_TITLE, f"Logcat session saved to: {archive_path}")
+                except Exception as exc:
+                    proceed = messagebox.askyesno(APP_TITLE, f"Could not save the Logcat session before exit: {exc}. Exit anyway?")
+                    if not proceed:
+                        return
+            else:
+                try:
+                    self.stop_logcat()
+                except Exception:
+                    pass
         self._closing = True
         try:
-            self.stop_logcat()
+            self.save_current_settings()
+        except Exception:
+            pass
+        try:
+            if self._active_operation_proc and self._active_operation_proc.poll() is None:
+                try:
+                    self._active_operation_proc.terminate()
+                except Exception:
+                    self._active_operation_proc.kill()
         except Exception:
             pass
         try:

@@ -1,2 +1,2 @@
-# ADB Control Center uses only Python standard-library modules.
-# Python 3.8+ recommended.
+# No external Python dependencies are required.
+# Uses Python standard library: tkinter, subprocess, pathlib, json, urllib.

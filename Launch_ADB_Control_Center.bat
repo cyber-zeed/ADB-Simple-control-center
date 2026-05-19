@@ -1,33 +1,15 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-
-set SCRIPT=ADB_Control_Center.py
-
-if not exist "%SCRIPT%" (
-    echo [ERROR] %SCRIPT% was not found in this folder.
-    echo Please keep this launcher in the same folder as %SCRIPT%.
-    pause
-    exit /b 1
-)
-
 where py >nul 2>nul
-if %ERRORLEVEL% EQU 0 (
-    py -3 "%SCRIPT%"
-    goto :end
+if %ERRORLEVEL%==0 (
+    py -3 ADB_Control_Center.py
+    goto :eof
 )
-
 where python >nul 2>nul
-if %ERRORLEVEL% EQU 0 (
-    python "%SCRIPT%"
-    goto :end
+if %ERRORLEVEL%==0 (
+    python ADB_Control_Center.py
+    goto :eof
 )
-
-echo [ERROR] Python 3 was not found.
-echo Install Python 3 from python.org, then run this launcher again.
-echo If Python is installed, make sure it is available in PATH.
+echo Python 3 was not found. Install Python 3 from the Installers tab or from python.org.
 pause
-exit /b 1
-
-:end
-endlocal

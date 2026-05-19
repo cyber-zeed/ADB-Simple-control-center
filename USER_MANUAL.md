@@ -1,175 +1,87 @@
-# ADB Control Center User Manual
+# User Manual — ADB Control Center v0.7.0
 
-Version: 0.6.5  
-Release date: 2026-05-18
+## Dashboard
 
-## 1. Starting the application
+The Dashboard shows ADB status, selected device information, and timestamped command output. Use it for quick checks: **Check ADB**, **Refresh Devices**, **Load Device Info**, **Start Server**, and **Kill Server**.
 
-Recommended:
+## Top toolbar
 
-```text
-Launch_ADB_Control_Center.bat
-```
+The top toolbar contains:
 
-Manual:
+- device selector
+- Refresh
+- Info
+- Reboot
+- Recovery
+- Bootloader
+- Root
 
-```powershell
-python .\ADB_Control_Center.py
-```
+The **Root** button runs `adb root`; it only works on devices/builds where `adbd` can run as root.
 
-The batch file first tries the Windows Python launcher `py -3`, then falls back to `python`.
+## APK tab
 
-## 2. First-time setup
+Use this tab to install and uninstall Android packages.
 
-1. Open the **Installers** tab.
-2. Click **Check Python**. If Python is missing, install Python 3.
-3. Click **Check 7-Zip**. If missing, install 7-Zip.
-4. Click **Check ADB**. If missing, choose an installation folder and install Platform-Tools.
-5. Connect your Android device by USB.
-6. Enable USB debugging on the device.
-7. Accept the authorization prompt on the device.
-8. Click **Refresh** in the app.
+New in v0.7.0: APK install uses a cancellable progress UI. If the install is very large or stalls, press **Cancel**.
 
-For system PATH updates, run the app as Administrator. If not elevated, ADB can still be installed, but system-wide PATH updates may be skipped.
+## Files tab
 
-## 3. Device bar
+Use this tab to:
 
-The top bar contains the selected ADB device and global actions.
+- push local files/folders to Android
+- pull Android files/folders to the PC
+- browse Android storage with a robust NUL-delimited file listing routine
+- open selected folders
+- push local content into the currently opened Android folder
 
-- **Refresh**: reloads connected devices.
-- **Info**: reads device properties and updates the dashboard.
-- **Reboot**: normal Android reboot.
-- **Recovery**: reboot to recovery.
-- **Bootloader**: reboot to bootloader.
+New in v0.7.0: large push/pull operations use a cancellable progress UI.
 
-## 4. Installers tab
+## Logcat tab
 
-### Android Platform-Tools
+Use **Start**, **Stop**, **New Session**, **Append Session**, **Clear Visible Only**, and **Save**.
 
-- Default folder: `C:db`
-- You can choose another folder.
-- **Check ADB** searches PATH and known folders.
-- **Install Platform-Tools** downloads/extracts the official package and attempts to update PATH.
-
-### Python 3
-
-- **Check Python** verifies Python availability.
-- **Install Python 3** resolves the latest official Windows x64 installer and runs it in passive mode.
-
-### 7-Zip
-
-- **Check 7-Zip** searches PATH and common install locations.
-- **Install 7-Zip** resolves the latest Windows x64 installer and runs it silently.
-
-All check/install actions are designed to run in worker threads so the GUI remains responsive.
-
-## 5. Logcat tab
-
-### Basic logging
-
-1. Select a device.
-2. Optionally set a logcat filter.
-3. Choose whether to prefix host timestamps.
-4. Click **Start Logcat**.
-
-### Session controls
-
-- **New Session**: clears visible logs and starts a fresh spool/session.
-- **Append Session**: keeps appending to the current session.
-- **Clear Visible Only**: clears the GUI text area but keeps the full spool file for saving.
-
-### Saving logs
-
-Manual save writes a `.7z` archive. The saved log includes:
-
-- export timestamp
-- selected device serial
-- manufacturer/model/build information when available
-- battery information when available
-- log contents
-
-Filename pattern:
+Filter examples:
 
 ```text
-<device_serial>_logcat_<timestamp>.7z
+gps
+text:gps
+regex:gps|gnss
+adb:-v threadtime -b radio
+ActivityManager:D *:S
 ```
 
-### USB disconnect rollover
+Normal text/regex filters are host-side display filters. The unfiltered log is still preserved in the spool file. When a host-side filter is active, the app also writes a filtered spool file in parallel.
 
-When enabled and a USB device disconnects while logging:
+## Capture tab
 
-1. The current session is automatically saved into `logs/`.
-2. The app waits for the same serial to reconnect.
-3. Logcat resumes into a fresh session.
+Use this tab for screenshots, screenrecord, and wireless ADB.
 
-## 6. Files tab
+New in v0.7.0: **Stop + Pull Screenrecord** uses a cancellable progress UI.
 
-The Files tab supports both direct push/pull paths and the remote Android browser.
+## Installers tab
 
-### Browse remote folders
+This tab can check/install:
 
-- **Refresh**: list current path.
-- **Up**: go to parent folder.
-- **Home**: go to `/sdcard/`.
-- Double-click a folder to enter it.
-- Select an item and use **Pull Selected** to copy it to the PC.
-- Use **Push Local to Current Folder** to push a PC file/folder into the currently displayed Android folder.
+- Android Platform-Tools / ADB
+- Python 3
+- 7-Zip
 
-v0.6.5 includes safer handling for blank/inaccessible remote paths and no longer shows raw internal error markers.
+Status checks and installers run in background workers so the GUI remains responsive.
 
-## 7. Shell and Raw ADB tabs
+## Persistent settings
 
-### Shell
-
-Runs commands through:
+Settings are saved automatically. On Windows, they are stored under:
 
 ```text
-adb shell <command>
+%APPDATA%\ADB Control Center\settings.json
 ```
 
-### Raw ADB
+Saved settings include the last selected device, paths/folders, Logcat options, reconnect option, TCP/IP port, Platform-Tools folder, and window geometry.
 
-Runs arbitrary ADB arguments. Example:
+## Closing while Logcat is running
 
-```text
-devices -l
-```
+When Logcat is running and you close the app, you will be asked whether to:
 
-Do not include the word `adb`; the app adds it automatically.
-
-## 8. APK and Packages tabs
-
-- Install APK.
-- Optional reinstall and permission grant.
-- Uninstall by package name.
-- List packages.
-- Show APK path.
-- Query battery info and device properties.
-
-## 9. Capture tab
-
-- Take screenshots and pull them to the PC.
-- Start/stop Android screenrecord.
-- Pull and remove the recorded file.
-- Use wireless ADB helpers.
-
-## 10. About menu
-
-Use **Help → About** to view app version, credits, contact e-mail, and GitHub link.
-
-Credits: Flavio Lira (CyberZeed)
-E-mail: fr.lira@gmail.com
-GitHub: https://github.com/Cyber-Zeed
-
-## Dashboard command output
-
-The Dashboard tab contains three areas: ADB Status, Device Info, and Command Output. In version 0.6.5, the Command Output area has quick action buttons:
-
-- Check ADB
-- Refresh Devices
-- Load Device Info
-- Start Server
-- Kill Server
-- Clear Output
-
-Dashboard actions write timestamped entries to Command Output. This makes it easier to confirm whether a button actually ran, what command was used, and what ADB returned.
+- save the current Logcat session and exit
+- exit without saving
+- cancel close and keep the app open
